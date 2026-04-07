@@ -27,6 +27,8 @@ train_img_dir: datasets/CamVid/train
 train_lbl_dir: datasets/CamVid/train_labels
 val_img_dir:   datasets/CamVid/val
 val_lbl_dir:   datasets/CamVid/val_labels
+test_img_dir:  datasets/CamVid/test
+test_lbl_dir:  datasets/CamVid/test_labels
 
 # ── Training ──────────────────────────────────────────────────────────────────
 batch_size:   4

@@ -64,7 +64,7 @@ def load_config(config_path: str) -> dict:
 
     # 데이터/가중치 경로를 절대경로로 변환
     for key in ("train_img_dir", "train_lbl_dir", "val_img_dir", "val_lbl_dir",
-                "save_dir", "pretrained_path"):
+                "test_img_dir", "test_lbl_dir", "save_dir", "pretrained_path"):
         if key in cfg and cfg[key]:
             p = Path(cfg[key])
             if not p.is_absolute():
@@ -581,8 +581,53 @@ def main():
         )
 
     print("\n" + "=" * 60)
-    print(f"Training complete. Best mIoU: {best_miou:.4f}")
+    print(f"Training complete. Best val mIoU: {best_miou:.4f}")
     print("=" * 60)
+
+    # ── Test evaluation (best checkpoint 기준, 1회) ───────────────────────────
+    test_img_dir = cfg.get("test_img_dir", "")
+    test_lbl_dir = cfg.get("test_lbl_dir", "")
+
+    if test_img_dir and test_lbl_dir:
+        best_path = os.path.join(cfg["save_dir"], f"{cfg['exp_name']}_best.pth")
+        if not os.path.exists(best_path):
+            print(f"\n[Test] best checkpoint 없음: {best_path} — test 생략")
+        else:
+            print(f"\n[Test] best checkpoint 로드: {best_path}")
+            ckpt = torch.load(best_path, map_location=device)
+            model.load_state_dict(ckpt["model"])
+
+            test_transform = build_transform(aug_type, cfg["input_size"], split="val")
+            test_dataset = CamVidDataset(
+                image_dir=test_img_dir,
+                label_dir=test_lbl_dir,
+                transforms=test_transform,
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=cfg["batch_size"],
+                shuffle=False,
+                num_workers=cfg["num_workers"],
+                pin_memory=True,
+            )
+            print(f"[Test] {len(test_dataset)} samples")
+
+            test_loss, test_miou, test_per_class = validate(
+                model, test_loader, criterion, device,
+                cfg["num_classes"], cfg["ignore_index"],
+            )
+
+            print("\n" + "=" * 60)
+            print(f"[Test Result] {cfg['exp_name']}")
+            print(f"  test_loss : {test_loss:.4f}")
+            print(f"  test_mIoU : {test_miou:.4f}")
+            print("  Per-class IoU:")
+            class_names = train_dataset.get_class_names()
+            for name, iou_val in zip(class_names, test_per_class):
+                print(f"    {name:<12s}: {iou_val:.4f}")
+            print("=" * 60)
+    else:
+        print("\n[Test] test_img_dir / test_lbl_dir 미설정 — test 생략")
 
 
 if __name__ == "__main__":

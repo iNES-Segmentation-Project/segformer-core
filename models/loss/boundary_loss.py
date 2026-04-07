@@ -123,7 +123,8 @@ class BoundaryLoss(nn.Module):
         t = targets_f.unsqueeze(1)                           # (B, 1, H, W)
 
         # padding=1로 공간 크기 유지
-        edge = F.conv2d(t, self.laplacian, padding=1)        # (B, 1, H, W)
+        # .to(t.device): 모듈이 .cuda() 호출을 받지 못한 경우에도 device를 맞춤
+        edge = F.conv2d(t, self.laplacian.to(t.device), padding=1)  # (B, 1, H, W)
 
         # 0이 아닌 위치 = 경계 픽셀
         boundary = (edge.abs() > 0).float()                  # (B, 1, H, W)
