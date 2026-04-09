@@ -70,8 +70,9 @@ def main():
     model = build_model(cfg).to(device)
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["model"])
-    print(f"  best checkpoint epoch: {ckpt.get('epoch', '?')}  "
-          f"val_mIoU: {ckpt.get('miou', '?'):.4f}")
+    miou_val = ckpt.get('miou', None)
+    miou_str = f"{miou_val:.4f}" if miou_val is not None else "?"
+    print(f"  best checkpoint epoch: {ckpt.get('epoch', '?')}  val_mIoU: {miou_str}")
 
     # ── Test Dataset ──────────────────────────────────────────────────────────
     aug_type = cfg.get("augmentation_type", "basic")
@@ -92,7 +93,7 @@ def main():
 
     # ── 평가 ─────────────────────────────────────────────────────────────────
     criterion = build_criterion(cfg)
-    test_loss, test_miou, test_per_class = validate(
+    test_loss, test_miou, test_per_class, test_mpa = validate(
         model, test_loader, criterion, device,
         cfg["num_classes"], cfg["ignore_index"],
     )
@@ -104,6 +105,7 @@ def main():
     print(f"[Test Result] {cfg['exp_name']}")
     print(f"  test_loss : {test_loss:.4f}")
     print(f"  test_mIoU : {test_miou:.4f}")
+    print(f"  test_mPA  : {test_mpa:.4f}")
     print("  Per-class IoU:")
     for name, iou_val in zip(class_names, test_per_class):
         print(f"    {name:<12s}: {iou_val:.4f}")

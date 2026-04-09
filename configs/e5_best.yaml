@@ -1,39 +1,39 @@
 # configs/e5_best.yaml
 #
-# E5 — Paper-like Experiment (최종 성능 확인)
-# ─────────────────────────────────────────────
-# E0~E4 internal 실험에서 선정된 best 구조에 적용하는 설정.
-# 구조 비교 실험이 아니라 "최대 성능 추출" 실험이다.
+# E5 — Paper-like Experiment (최종 성능 극대화)
+# ─────────────────────────────────────────────────────────────────────────────
+# E0~E4 internal 실험 결과 기준 best 구조에 paper-like 설정을 적용하는 실험.
+# 구조 비교가 목적이 아닌 "최대 성능 추출"이 목적.
 #
-# 사용 전 교체 필요 항목:
-#   model_type   ← E0~E4 결과 기준 best 구조로 변경
-#   loss_type    ← E0~E4 결과 기준 best loss로 변경
-#   exp_name     ← model_type / loss_type 반영해서 변경
-#   pretrained_path ← 실제 MiT-B0 가중치 파일 경로로 변경
-#
-# internal yaml(E0~E4)과 달라지는 핵심 설정:
-#   augmentation_type : basic → paperlike
-#   pretrained        : false → true
-#   scheduler_type    : poly  → warmup_poly
-#   epochs            : 40    → 100
-#   input_size        : [360, 480] → [512, 512]
+# internal(E0~E4) 대비 변경 핵심:
+#   pretrained       : false  → true  (MiT-B0 ImageNet-1K)
+#   augmentation_type: basic  → paperlike
+#   scheduler_type   : poly   → warmup_poly
+#   differential_lr  : (없음) → true  (encoder 6e-5 / decoder 6e-4)
+#   epochs           : 40     → 100
+#   input_size       : [360,480] → [512, 512]
 
-exp_name: e5_best_internal  # ← best 구조 확정 후 교체
+exp_name: e5_fpn_ce_dice_boundary  # best 구조 확정 후 교체
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-model_type:  mlp        # ← E0~E4 best 구조로 교체 (mlp | fpn)
+model_type:  fpn        # E0~E4 best 구조 (mlp | fpn)
 num_classes: 11
 embed_dim:   256
 dropout:     0.1
-pretrained:  true
-pretrained_path: weights/mit_b0_backbone.pth  # ← 실제 경로로 교체
+
+# Pretrained MiT-B0 backbone (ImageNet-1K)
+# 로컬 .pth 또는 HF model ID 모두 지원:
+#   "weights/mit_b0_backbone.pth" → 로컬 파일 직접 로드
+#   "nvidia/mit-b0"               → HF에서 다운로드 (캐시 활용)
+pretrained:    true
+hf_model_name: nvidia/mit-b0
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
-loss_type: ce           # ← E0~E4 best loss로 교체 (ce | focal | ce_dice | ce_boundary)
+loss_type: ce_dice_boundary  # E5 전용: 1.0*CE + 1.0*Dice + 0.1*Boundary
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-input_size:        [512, 512]   # internal(360×480) 대비 확대
-augmentation_type: paperlike    # internal=basic → E5 전용
+input_size:        [512, 512]
+augmentation_type: paperlike
 num_workers:       4
 
 train_img_dir: datasets/CamVid/train
@@ -45,13 +45,18 @@ test_lbl_dir:  datasets/CamVid/test_labels
 
 # ── Training ──────────────────────────────────────────────────────────────────
 batch_size:   4
-epochs:       100               # internal(40) 대비 확대
-lr:           6.0e-5
+epochs:       100
+lr:           6.0e-5       # encoder lr = 6e-5, decoder lr = 6e-4 (differential_lr 참고)
 weight_decay: 0.01
 
+# Differential LR — SegFormer 논문 원칙
+#   encoder (pretrained): lr × 1 = 6e-5  → 미세조정
+#   decoder (scratch)   : lr × 10 = 6e-4 → 처음부터 학습
+differential_lr: true
+
 # ── Scheduler ─────────────────────────────────────────────────────────────────
-scheduler_type: warmup_poly     # internal=poly → E5 전용
-warmup_ratio:   0.1             # 전체 iter의 10% warmup
+scheduler_type: warmup_poly
+warmup_ratio:   0.1        # 전체 iter의 10% (약 10 epoch) warmup
 
 # ── Output ────────────────────────────────────────────────────────────────────
 save_dir: weights
