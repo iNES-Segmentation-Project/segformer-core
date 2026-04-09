@@ -89,71 +89,6 @@ def load_config(config_path: str) -> dict:
 # ── 팩토리 함수 ───────────────────────────────────────────────────────────────
 # =============================================================================
 
-def load_pretrained_encoder(model: nn.Module, weight_path: str) -> None:
-    """
-    encoder에만 pretrained 가중치를 로드.
-    decoder / segmentation head는 로드하지 않음.
-
-    지원 형식:
-      1. 우리 full model 체크포인트 (train.py 저장 형식)
-         → ckpt["model"] 에서 "encoder.*" 키만 추출 후 prefix 제거
-      2. encoder-only state_dict
-         → keys가 "stages.*" 로 시작하면 그대로 사용
-
-    MMSeg backbone 형식 ("backbone.*")은 미지원 — 키 변환 필요.
-    """
-    path = Path(weight_path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"[pretrained] 가중치 파일 없음: {path}\n"
-            "  config의 pretrained_path 경로를 확인하세요."
-        )
-
-    ckpt = torch.load(str(path), map_location="cpu")
-
-    # ── checkpoint wrapper 처리 ────────────────────────────────────────────────
-    # train.py가 저장하는 형식: {"epoch": ..., "model": {...}, "optimizer": ...}
-    if isinstance(ckpt, dict) and "model" in ckpt:
-        state_dict = ckpt["model"]
-    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
-        state_dict = ckpt["state_dict"]
-    else:
-        state_dict = ckpt  # 이미 state_dict
-
-    # ── key 형식 감지 및 정규화 (전체 키 기준) ───────────────────────────────
-    all_keys = list(state_dict.keys())
-
-    has_encoder_prefix  = any(k.startswith("encoder.")  for k in all_keys)
-    has_backbone_prefix = any(k.startswith("backbone.") for k in all_keys)
-
-    if has_encoder_prefix:
-        # 형식 1: full model state_dict → encoder 키만 추출 후 prefix 제거
-        state_dict = {
-            k[len("encoder."):]: v
-            for k, v in state_dict.items()
-            if k.startswith("encoder.")
-        }
-    elif has_backbone_prefix:
-        raise ValueError(
-            "[pretrained] MMSeg backbone 형식('backbone.*')은 미지원.\n"
-            "  지원 형식: (1) 우리 체크포인트의 'encoder.*' 키\n"
-            "             (2) encoder-only state_dict의 'stages.*' 키"
-        )
-    # else: 형식 2 — 이미 encoder-only ('stages.*'), 그대로 사용
-
-    # ── encoder에만 로드 (decoder 키는 state_dict에 없으므로 자동 제외) ────────
-    missing, unexpected = model.encoder.load_state_dict(state_dict, strict=False)
-
-    print(f"  [pretrained] 로드 완료: {path.name}")
-    if not missing and not unexpected:
-        print("  [pretrained] 모든 encoder 키 정상 로드.")
-    if missing:
-        print(f"  [pretrained] Missing keys  ({len(missing)}): "
-              f"{missing[:3]}{'...' if len(missing) > 3 else ''}")
-    if unexpected:
-        print(f"  [pretrained] Unexpected keys ({len(unexpected)}): "
-              f"{unexpected[:3]}{'...' if len(unexpected) > 3 else ''}")
-
 
 def build_model(cfg: dict) -> nn.Module:
     """model_type에 따라 SegFormer 모델을 생성. pretrained=true 이면 encoder에만 가중치 로드."""
@@ -177,13 +112,9 @@ def build_model(cfg: dict) -> nn.Module:
     # ── pretrained encoder 로드 (E5 / paperlike 전용) ─────────────────────────
     # pretrained=false 이면 이 블록 전체를 건너뜀 → E0~E4에 영향 없음
     if cfg.get("pretrained", False):
-        pretrained_path = cfg.get("pretrained_path", "")
-        if not pretrained_path:
-            raise ValueError(
-                "[pretrained] pretrained=true이지만 pretrained_path가 비어 있습니다.\n"
-                "  config에 pretrained_path: <path/to/weights.pth> 를 추가하세요."
-            )
-        load_pretrained_encoder(model, pretrained_path)
+        from utils.checkpoint import load_pretrained_encoder as load_hf_encoder
+        hf_model_name = cfg.get("hf_model_name", "nvidia/mit-b0")
+        load_hf_encoder(model, hf_model_name)
 
     return model
 
@@ -202,10 +133,20 @@ def build_criterion(cfg: dict) -> nn.Module:
         return CombinedLoss(mode="ce+dice", num_classes=num_classes, ignore_index=ignore_index)
     elif loss_type == "ce_boundary":
         return CombinedLoss(mode="ce+boundary", num_classes=num_classes, ignore_index=ignore_index)
+    elif loss_type == "ce_dice_boundary":
+        # E5 전용: 1.0*CE + 1.0*Dice + 0.1*Boundary
+        return CombinedLoss(
+            mode="ce+dice+boundary",
+            num_classes=num_classes,
+            ignore_index=ignore_index,
+            ce_weight=1.0,
+            aux_weight=1.0,
+            boundary_weight=0.1,
+        )
     else:
         raise ValueError(
             f"Unknown loss_type: '{loss_type}'. "
-            "Choose 'ce', 'focal', 'ce_dice', or 'ce_boundary'."
+            "Choose 'ce', 'focal', 'ce_dice', 'ce_boundary', or 'ce_dice_boundary'."
         )
 
 
@@ -288,19 +229,25 @@ class MeanIoU:
         """
         Returns:
             miou        : float  — mean IoU over valid classes
-            per_class   : list   — per-class IoU (NaN if class absent)
+            per_class   : list   — per-class IoU
+            mpa         : float  — mean Pixel Accuracy over valid classes
         """
         conf = self.confusion.float()
-        intersection = conf.diag()                     # (C,)
-        union = conf.sum(1) + conf.sum(0) - intersection  # (C,)
+        intersection = conf.diag()                          # (C,)
+        union = conf.sum(1) + conf.sum(0) - intersection   # (C,)
 
-        iou = intersection / union.clamp(min=1e-6)    # (C,)
+        iou = intersection / union.clamp(min=1e-6)         # (C,)
 
         # GT에 한 번도 등장하지 않은 class는 제외
         valid_classes = conf.sum(1) > 0
         miou = iou[valid_classes].mean().item()
 
-        return miou, iou.tolist()
+        # mPA: 클래스별 픽셀 정확도 = TP / GT_total_per_class
+        # = confusion.diag() / confusion.sum(dim=1)
+        pa = intersection / conf.sum(1).clamp(min=1e-6)    # (C,)
+        mpa = pa[valid_classes].mean().item()
+
+        return miou, iou.tolist(), mpa
 
 
 # =============================================================================
@@ -396,9 +343,9 @@ def validate(
         miou_calc.update(preds.cpu(), masks.cpu())
 
     avg_loss = total_loss / len(loader)
-    miou, per_class_iou = miou_calc.compute()
+    miou, per_class_iou, mpa = miou_calc.compute()
 
-    return avg_loss, miou, per_class_iou
+    return avg_loss, miou, per_class_iou, mpa
 
 
 # =============================================================================
@@ -408,6 +355,7 @@ def validate(
 def save_checkpoint(
     model,
     optimizer,
+    scheduler,
     epoch: int,
     miou: float,
     save_dir: str,
@@ -417,10 +365,10 @@ def save_checkpoint(
     os.makedirs(save_dir, exist_ok=True)
 
     state = {
-        "epoch":      epoch,
-        "miou":       miou,
-        "model":      model.state_dict(),
-        "optimizer":  optimizer.state_dict(),
+        "epoch":     epoch,
+        "model":     model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
     }
 
     # 매 epoch 저장 (덮어쓰기)
@@ -496,8 +444,22 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = build_model(cfg).to(device)
+
+    # ── Params ────────────────────────────────────────────────────────────────
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model params: {total_params:,}")
+
+    # ── GFLOPs (fvcore) ───────────────────────────────────────────────────────
+    try:
+        from fvcore.nn import FlopCountAnalysis
+        _dummy = torch.randn(1, 3, *cfg["input_size"]).to(device)
+        flops  = FlopCountAnalysis(model, _dummy)
+        flops.unsupported_ops_settings(raise_if_not_supported=False)
+        gflops = flops.total() / 1e9
+        print(f"Model GFLOPs: {gflops:.2f} G  (input {cfg['input_size']})")
+        del _dummy
+    except Exception as e:
+        print(f"Model GFLOPs: 측정 실패 ({e})")
 
     # ── Loss ──────────────────────────────────────────────────────────────────
     criterion = build_criterion(cfg)
@@ -506,10 +468,21 @@ def main():
     encoder_params = list(model.encoder.parameters())
     decoder_params = list(model.decoder.parameters())
 
+    # differential_lr=true (E5): encoder lr × 1, decoder lr × 10
+    #   → pretrained backbone은 낮은 lr로 미세조정, decoder는 높은 lr로 처음부터 학습
+    #   → SegFormer 논문 원칙과 동일 (backbone lr = head lr / 10)
+    # differential_lr=false (E0~E4, default): 둘 다 lr × 10 (pretrained 없으니 동일하게)
+    if cfg.get("differential_lr", False):
+        encoder_lr = cfg["lr"]
+        decoder_lr = cfg["lr"] * 10
+    else:
+        encoder_lr = cfg["lr"] * 10
+        decoder_lr = cfg["lr"] * 10
+
     optimizer = torch.optim.AdamW(
         [
-            {"params": encoder_params, "lr": cfg["lr"] * 10},
-            {"params": decoder_params, "lr": cfg["lr"] * 10},
+            {"params": encoder_params, "lr": encoder_lr},
+            {"params": decoder_params, "lr": decoder_lr},
         ],
         weight_decay=cfg["weight_decay"],
     )
@@ -523,6 +496,19 @@ def main():
     # - poly        : epoch 단위 (main 루프에서 1회/epoch) — E0~E4 baseline과 동일
     # - warmup_poly : iteration 단위 (train_one_epoch 내 batch마다) — E5 전용
 
+    # ── Resume ────────────────────────────────────────────────────────────────
+    start_epoch = 1
+    last_path   = os.path.join(cfg["save_dir"], f"{cfg['exp_name']}_last.pth")
+
+    if os.path.exists(last_path):
+        ckpt = torch.load(last_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"] + 1
+        print(f"[Resume] Loaded checkpoint from {last_path}")
+        print(f"[Resume] Start from epoch {start_epoch}")
+
     # ── 학습 루프 ─────────────────────────────────────────────────────────────
     best_miou = 0.0
 
@@ -530,7 +516,7 @@ def main():
     print(f"Training: {cfg['exp_name']}  |  {cfg['epochs']} epochs")
     print("=" * 60)
 
-    for epoch in range(1, cfg["epochs"] + 1):
+    for epoch in range(start_epoch, cfg["epochs"] + 1):
         t0 = time.time()
 
         # Train
@@ -544,7 +530,7 @@ def main():
             scheduler.step()
 
         # Validate
-        val_loss, miou, per_class_iou = validate(
+        val_loss, miou, per_class_iou, mpa = validate(
             model, val_loader, criterion, device,
             cfg["num_classes"], cfg["ignore_index"],
         )
@@ -558,6 +544,7 @@ def main():
             f"| train_loss: {train_loss:.4f} "
             f"| val_loss: {val_loss:.4f} "
             f"| mIoU: {miou:.4f} "
+            f"| mPA: {mpa:.4f} "
             f"| lr: {current_lr:.2e} "
             f"| time: {elapsed:.1f}s"
         )
@@ -575,8 +562,9 @@ def main():
             best_miou = miou
 
         save_checkpoint(
-            model, optimizer, epoch, miou,
-            cfg["save_dir"], cfg["exp_name"],
+            model, optimizer, scheduler, epoch, miou,
+            cfg["save_dir"],
+            exp_name=cfg["exp_name"],
             is_best=is_best,
         )
 
@@ -612,7 +600,7 @@ def main():
             )
             print(f"[Test] {len(test_dataset)} samples")
 
-            test_loss, test_miou, test_per_class = validate(
+            test_loss, test_miou, test_per_class, test_mpa = validate(
                 model, test_loader, criterion, device,
                 cfg["num_classes"], cfg["ignore_index"],
             )
@@ -621,6 +609,7 @@ def main():
             print(f"[Test Result] {cfg['exp_name']}")
             print(f"  test_loss : {test_loss:.4f}")
             print(f"  test_mIoU : {test_miou:.4f}")
+            print(f"  test_mPA  : {test_mpa:.4f}")
             print("  Per-class IoU:")
             class_names = train_dataset.get_class_names()
             for name, iou_val in zip(class_names, test_per_class):

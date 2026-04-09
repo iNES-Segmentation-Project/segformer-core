@@ -5,14 +5,8 @@ numpy
 opencv-python
 Pillow
 
-tqdm
 pyyaml
 
-matplotlib
-
-scikit-learn
-
-albumentations
+transformers
 
 fvcore
-thop

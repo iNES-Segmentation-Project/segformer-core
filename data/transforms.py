@@ -136,6 +136,9 @@ class PaperlikeTransform:
         flip_prob   (float): HorizontalFlip 확률. Default: 0.5.
         brightness  (float): ColorJitter brightness jitter 강도. Default: 0.2.
         contrast    (float): ColorJitter contrast jitter 강도. Default: 0.2.
+        saturation  (float): ColorJitter saturation jitter 강도. Default: 0.2.
+                             SegFormer 논문 PhotoMetricDistortion의 saturation에 대응.
+                             PIL ImageEnhance.Color 사용 (torchvision 불필요).
         mean        (list):  Normalize mean. Default: ImageNet mean.
         std         (list):  Normalize std.  Default: ImageNet std.
     """
@@ -148,6 +151,7 @@ class PaperlikeTransform:
         flip_prob: float = 0.5,
         brightness: float = 0.2,
         contrast: float = 0.2,
+        saturation: float = 0.2,
         mean: list = IMAGENET_MEAN,
         std:  list = IMAGENET_STD,
     ):
@@ -157,6 +161,7 @@ class PaperlikeTransform:
         self.flip_prob   = flip_prob
         self.brightness  = brightness
         self.contrast    = contrast
+        self.saturation  = saturation
         self.mean = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
         self.std  = torch.tensor(std,  dtype=torch.float32).view(3, 1, 1)
 
@@ -277,16 +282,34 @@ class PaperlikeTransform:
 
     def _color_jitter(self, image: Image.Image) -> Image.Image:
         """
-        Brightness / Contrast jitter — PIL ImageEnhance 사용.
+        Brightness / Contrast / Saturation jitter — PIL ImageEnhance 사용.
         torchvision 의존성 없음. mask에는 적용하지 않음.
         factor = 1.0 + Uniform(-strength, +strength)
+
+        SegFormer 논문 PhotoMetricDistortion 대응:
+          brightness  → ImageEnhance.Brightness
+          contrast    → ImageEnhance.Contrast
+          saturation  → ImageEnhance.Color  (색 채도)
         """
+        # 적용 순서를 랜덤으로 섞어 더 다양한 augmentation 생성
+        ops = []
         if self.brightness > 0:
-            factor = 1.0 + random.uniform(-self.brightness, self.brightness)
-            image = ImageEnhance.Brightness(image).enhance(max(0.0, factor))
+            ops.append(('brightness', self.brightness))
         if self.contrast > 0:
-            factor = 1.0 + random.uniform(-self.contrast, self.contrast)
-            image = ImageEnhance.Contrast(image).enhance(max(0.0, factor))
+            ops.append(('contrast', self.contrast))
+        if self.saturation > 0:
+            ops.append(('saturation', self.saturation))
+        random.shuffle(ops)
+
+        for op, strength in ops:
+            factor = 1.0 + random.uniform(-strength, strength)
+            factor = max(0.0, factor)
+            if op == 'brightness':
+                image = ImageEnhance.Brightness(image).enhance(factor)
+            elif op == 'contrast':
+                image = ImageEnhance.Contrast(image).enhance(factor)
+            elif op == 'saturation':
+                image = ImageEnhance.Color(image).enhance(factor)
         return image
 
 
