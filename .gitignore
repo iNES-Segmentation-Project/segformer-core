@@ -208,3 +208,7 @@ __marimo__/
 
 # datasets 폴더 무시
 datasets/*
+
+# Markdown files (except README)
+*.md
+!README.md
